@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/net/context"
 )
@@ -116,22 +117,22 @@ func NewRequest(bufConn io.Reader) (*Request, error) {
 }
 
 // handleRequest is used for request processing after authentication
-func (s *Server) handleRequest(req *Request, conn conn) error {
+func (s *Server) handleRequest(req *Request, conn net.Conn) error {
 	ctx := context.Background()
 
 	// Resolve the address if we have a FQDN
-	dest := req.DestAddr
-	if dest.FQDN != "" {
-		ctx_, addr, err := s.config.Resolver.Resolve(ctx, dest.FQDN)
-		if err != nil {
-			if err := sendReply(conn, hostUnreachable, nil); err != nil {
-				return fmt.Errorf("Failed to send reply: %v", err)
-			}
-			return fmt.Errorf("Failed to resolve destination '%v': %v", dest.FQDN, err)
-		}
-		ctx = ctx_
-		dest.IP = addr
-	}
+	// dest := req.DestAddr
+	// if dest.FQDN != "" {
+	// 	ctx_, addr, err := s.config.Resolver.Resolve(ctx, dest.FQDN)
+	// 	if err != nil {
+	// 		if err := sendReply(conn, hostUnreachable, nil); err != nil {
+	// 			return fmt.Errorf("Failed to send reply: %v", err)
+	// 		}
+	// 		return fmt.Errorf("Failed to resolve destination '%v': %v", dest.FQDN, err)
+	// 	}
+	// 	ctx = ctx_
+	// 	dest.IP = addr
+	// }
 
 	// Apply any address rewrites
 	req.realDestAddr = req.DestAddr
@@ -156,7 +157,7 @@ func (s *Server) handleRequest(req *Request, conn conn) error {
 }
 
 // handleConnect is used to handle a connect command
-func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) error {
+func (s *Server) handleConnect(ctx context.Context, conn net.Conn, req *Request) error {
 	// Check if this is allowed
 	if ctx_, ok := s.config.Rules.Allow(ctx, req); !ok {
 		if err := sendReply(conn, ruleFailure, nil); err != nil {
@@ -199,8 +200,19 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 
 	// Start proxying
 	errCh := make(chan error, 2)
-	go proxy(target, req.bufConn, errCh)
-	go proxy(conn, target, errCh)
+	go func() {
+		_, err := io.Copy(target, req.bufConn)
+
+		conn.SetDeadline(time.Now())   // wake up the other goroutine blocking on right
+		target.SetDeadline(time.Now()) // wake up the other goroutine blocking on left
+		errCh <- err
+	}()
+	_, err = io.Copy(conn, target)
+	target.SetDeadline(time.Now()) // wake up the other goroutine blocking on left
+	conn.SetDeadline(time.Now())   // wake up the other goroutine blocking on right
+	errCh <- err
+	// go proxy(target, req.bufConn, errCh)
+	// go proxy(conn, target, errCh)
 
 	// Wait
 	for i := 0; i < 2; i++ {
